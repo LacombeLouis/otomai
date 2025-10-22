@@ -6,7 +6,6 @@ import typing as T
 
 import pydantic as pdt
 
-from otomai.core.parameters import StrategyParams
 
 
 # %% ORDERS

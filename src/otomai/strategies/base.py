@@ -1,16 +1,11 @@
 # %% IMPORTS
 
 import abc
-import asyncio
 import typing as T
 import re
-import time
 
 import pydantic as pdt
 
-from otomai.configs import logger
-from otomai.core import utils
-from otomai.core.models import Position
 from otomai.services import (
     ExchangeServiceKind,
     NotifierServiceKind,
@@ -18,6 +13,7 @@ from otomai.services import (
     DynamoDB,
 )
 from otomai.core.parameters import TradingParams, StrategyParams
+from otomai.strategies.managers import PositionMonitor, OrderManager
 
 # %% VARIABLES
 
@@ -41,6 +37,28 @@ class Strategy(abc.ABC, pdt.BaseModel, strict=True, extra="forbid"):
     strategy_params: StrategyParams = pdt.Field(...)
     trading_params: TradingParams = pdt.Field(...)
 
+    _position_monitor: T.Optional[PositionMonitor] = None
+    _order_manager: T.Optional[OrderManager] = None
+
+    @property
+    def position_monitor(self) -> PositionMonitor:
+        """Lazy initialization of PositionMonitor."""
+        if self._position_monitor is None:
+            self._position_monitor = PositionMonitor(
+                exchange_service=self.exchange_service,
+                notifier_service=self.notifier_service,
+                database_service=self.database_service,
+                strategy_name=self.strategy_params.name,
+            )
+        return self._position_monitor
+
+    @property
+    def order_manager(self) -> OrderManager:
+        """Lazy initialization of OrderManager."""
+        if self._order_manager is None:
+            self._order_manager = OrderManager(exchange_service=self.exchange_service)
+        return self._order_manager
+
     def __enter__(self) -> "Strategy":
         """
         Enter method for context manager.
@@ -59,92 +77,32 @@ class Strategy(abc.ABC, pdt.BaseModel, strict=True, extra="forbid"):
         """
 
     def position_opening_available(self, max_simultaneous_positions: int) -> bool:
-        open_positions = len(self.exchange_service.session.fetch_positions())
-        open_orders = len(self.exchange_service.session.fetch_open_orders())
-        return open_positions + open_orders < max_simultaneous_positions
+        """Check if a new position can be opened."""
+        return self.position_monitor.check_position_opening_available(
+            max_simultaneous_positions
+        )
 
-    async def monitor_position_opening(self, symbol, order_timeout: int = 600):
-        open_position = {}
-        start_time = time.time()
-
-        while not open_position:
-            open_position = self.exchange_service.session.fetch_position(symbol)
-            if open_position:
-                await self.notifier_service.send_message(
-                    message=f"### {self.strategy_params.name} ### \n\n✅ Position successfully open for {symbol}."
-                )
-                return
-
-            if time.time() - start_time > order_timeout:
-                await self.notifier_service.send_message(
-                    message=f"### {self.strategy_params.name} ### \n\n⚠️ Timeout: Failed to open position for {symbol} within {order_timeout} seconds."
-                )
-                return
-
-            await asyncio.sleep(1)
+    async def monitor_position_opening(self, symbol: str, order_timeout: int = 600):
+        """Monitor position opening until it's confirmed or times out."""
+        return await self.position_monitor.monitor_position_opening(
+            symbol, order_timeout
+        )
 
     async def monitor_position_closing(
         self,
         symbol: str,
         open_date: str,
     ):
-        sleep_time = 60
-        while True:
-            positions_history = self.exchange_service.session.fetch_positions_history(
-                symbols=[symbol], since=utils.get_ts_in_ms_from_date(open_date)
-            )
-
-            if positions_history:
-                position_history = positions_history[0]
-                position_history_info = position_history.get("info", {})
-                net_profit = position_history_info.get("netProfit")
-
-                if net_profit is not None:
-                    try:
-                        position = Position(
-                            symbol=symbol,
-                            net_profit=str(net_profit),
-                            open_price=str(position_history_info.get("openAvgPrice")),
-                            close_price=str(position_history_info.get("closeAvgPrice")),
-                            hold_side=str(position_history_info.get("holdSide")),
-                            open_date=str(
-                                utils.get_date_from_ts_in_ms(
-                                    int(position_history_info["ctime"])
-                                )
-                            ),
-                            close_date=str(
-                                utils.get_date_from_ts_in_ms(
-                                    int(position_history_info["utime"])
-                                )
-                            ),
-                            strategy_params=str(self.strategy_params),
-                        )
-                        self.database_service.insert_position(position)
-                        logger.info(
-                            f"Position for {symbol} saved successfully with net profit: {net_profit}"
-                        )
-                        await self.notifier_service.send_message(
-                            message=(
-                                f"### {self.strategy_params.name} ###\n\n"
-                                f"Position successfully closed for {symbol} with {position.net_profit}$ net profit"
-                            )
-                        )
-                        return
-                    except Exception as e:
-                        logger.error(f"Failed to insert position for {symbol}: {e}")
-                        raise RuntimeError(
-                            f"Error inserting position for {symbol}"
-                        ) from e
-                else:
-                    logger.info(
-                        f"No net profit available yet for {symbol}, retrying in {sleep_time} seconds..."
-                    )
-
-            await asyncio.sleep(sleep_time)
+        """Monitor position closing and save to database when closed."""
+        return await self.position_monitor.monitor_position_closing(
+            symbol, open_date, str(self.strategy_params)
+        )
 
     async def monitor_position(self, symbol: str, open_date: str):
-        await self.monitor_position_opening(symbol)
-        await self.monitor_position_closing(symbol, open_date)
+        """Monitor both opening and closing of a position."""
+        await self.position_monitor.monitor_position(
+            symbol, open_date, str(self.strategy_params)
+        )
 
     @abc.abstractmethod
     async def run(self) -> T.Any:

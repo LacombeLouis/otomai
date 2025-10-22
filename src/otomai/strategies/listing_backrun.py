@@ -138,7 +138,7 @@ class ListingBackrunStrategy(Strategy):
             and str(signal) in trading_params.allowed_order_sides
         ):
             open_date_str = str(datetime.now(timezone.utc))
-            order = self.exchange_service.open_future_order(
+            order = self.order_manager.open_future_order(
                 symbol=symbol,
                 equity_trade_pct=trading_params.equity_trade_pct,
                 order_type=trading_params.order_type,

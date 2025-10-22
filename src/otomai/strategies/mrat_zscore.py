@@ -9,7 +9,6 @@ import ta
 from pandera.typing import DataFrame
 
 from otomai.core.enums import OrderSide, TradeSide, OrderType
-from otomai.core import utils
 from otomai.core.parameters import MratZscoreStrategyParams
 from otomai.core.schemas import OHLCVSchema, MratZscoreKpiSchema
 from otomai.core.indicators import MRAT
@@ -118,13 +117,8 @@ class MratZscoreStrategy(Strategy):
         return above_z_score_threshold and position_condition and candle_condition
 
     def _get_order_creation_amount(self, equity_trade_pct: float) -> float:
-        try:
-            balance = self.exchange_service.session.fetch_balance()
-            free_amount = balance["USDT"]["free"]
-            return free_amount * equity_trade_pct / 100
-        except Exception as e:
-            logger.error(f"Error calculating new position amount: {e}")
-            return 0.0
+        """Calculate the amount for order creation based on available balance."""
+        return self.order_manager.get_order_creation_amount(equity_trade_pct)
 
     def _should_open_position(
         self,
@@ -222,34 +216,29 @@ class MratZscoreStrategy(Strategy):
         margin_mode: str,
         reduce: bool,
     ):
-        ticker = self.exchange_service.session.fetch_ticker(symbol=symbol)
-        last_price = float(ticker["info"]["lastPr"])
+        last_price, take_profit_price, stop_loss_price = (
+            self.order_manager.calculate_prices(
+                symbol=symbol,
+                order_side=order_side,
+                take_profit_pct=self.trading_params.take_profit_pct,
+                stop_loss_pct=self.trading_params.stop_loss_pct,
+                leverage=self.trading_params.leverage,
+            )
+        )
         size = self._get_order_creation_amount(self.trading_params.equity_trade_pct)
         amount = size / last_price
 
-        take_profit_price = utils.calculate_take_profit_price(
-            last_price,
-            order_side,
-            self.trading_params.take_profit_pct,
-            self.trading_params.leverage,
-        )
-        stop_loss_price = utils.calculate_stop_loss_price(
-            last_price,
-            order_side,
-            self.trading_params.stop_loss_pct,
-            self.trading_params.leverage,
-        )
         try:
-            self.exchange_service.set_margin_mode_and_leverage(
+            self.order_manager.set_margin_mode_and_leverage(
                 symbol=symbol,
                 margin_mode=self.trading_params.margin_mode,
                 leverage=self.trading_params.leverage,
             )
-            order = self.exchange_service.create_order(
+            order = self.order_manager.create_order(
                 symbol=symbol,
-                side=order_side,
+                order_side=order_side,
                 amount=amount,
-                type=order_type,
+                order_type=order_type,
                 margin_mode=margin_mode,
                 trade_side=TradeSide.OPEN,
                 take_profit_price=take_profit_price,
@@ -267,11 +256,11 @@ class MratZscoreStrategy(Strategy):
         self, symbol: str, order_type: str, margin_mode: str
     ) -> T.Dict:
         pos = self.exchange_service.session.fetch_position(symbol=symbol)
-        return self.exchange_service.create_order(
+        return self.order_manager.create_order(
             symbol=symbol,
-            side=OrderSide.BUY,
+            order_side=OrderSide.BUY,
             amount=pos["contracts"],
-            type=order_type,
+            order_type=order_type,
             margin_mode=margin_mode,
             trade_side=TradeSide.CLOSE,
             reduce=True,
